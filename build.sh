@@ -8,16 +8,4 @@
 #SBATCH --cpus-per-task=64
 #SBATCH --partition=short
 
-set -e
-
-echo "Loading modules..."
-module load cuda
-
-echo "Building..."
-mkdir -p build && cd build
-cmake -DNCCL_ROOT="$NCCL_HOME" ..
-
-cmake --build . --parallel "$SLURM_CPUS_PER_TASK"
-cd ..
-echo "Build complete."
-
+./build_script.sh
