@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=multi-gpu_cuSPARSE
+#SBATCH --job-name=test_poisson_csr
 #SBATCH --nodes=2
 #SBATCH --gres=gpu:l40s:4
 #SBATCH --ntasks-per-node=4
@@ -14,11 +14,13 @@
 set -e
 
 module load cuda
+
+cd "$SLURM_SUBMIT_DIR"
 mkdir -p logs
 
 export NCCL_SOCKET_IFNAME=ens2,ib0
 export NCCL_DEBUG=INFO
-
-echo "Running..."
+echo "Running CSR Poisson test..."
 srun -N 2 --gpus-per-node=4 --ntasks-per-node=4 --mpi=pmix \
-  ./build/par_bsr_mpi
+  ./build/test_poisson
+
