@@ -7,7 +7,22 @@ find_package(OpenMP REQUIRED)
 
 # Optional MFEM support
 set(MFEM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/mfem-4.8" CACHE PATH "MFEM installation directory")
-set(HYPRE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/hypre-2.26.0/src/hypre" CACHE PATH "Hypre installation directory")
+
+# Prefer explicit env-provided HYPRE_DIR. Otherwise, try sensible defaults.
+set(HYPRE_DIR_DEFAULT "$ENV{HYPRE_DIR}")
+if(NOT HYPRE_DIR_DEFAULT)
+  if(EXISTS "$ENV{HOME}/opt/src/hypre-gpu/include/HYPRE.h")
+    set(HYPRE_DIR_DEFAULT "$ENV{HOME}/opt/src/hypre-gpu")
+  elseif(EXISTS "$ENV{HOME}/opt/src/hypre/src/hypre/include/HYPRE.h")
+    set(HYPRE_DIR_DEFAULT "$ENV{HOME}/opt/src/hypre/src/hypre")
+  endif()
+endif()
+set(HYPRE_DIR "${HYPRE_DIR_DEFAULT}" CACHE PATH "Hypre installation directory")
+
+if(NOT EXISTS "${HYPRE_DIR}/include/HYPRE.h")
+  message(FATAL_ERROR "HYPRE not found. Set -DHYPRE_DIR=/path/to/hypre[/src/hypre] (with include/HYPRE.h and lib/libHYPRE.a)")
+endif()
+
 set(METIS_DIR "$ENV{HOME}/opt/src/metis-5.1.0" CACHE PATH "METIS installation directory")
 
 # NCCL: use NCCL_HOME or provide -DNCCL_ROOT=/path when configuring
@@ -83,6 +98,7 @@ target_include_directories(dg_diffusion
     ${MFEM_DIR}
     ${MFEM_DIR}/include
     ${HYPRE_DIR}/include
+    ${CUDAToolkit_INCLUDE_DIRS}
 )
 
 target_link_libraries(dg_diffusion
@@ -92,6 +108,10 @@ target_link_libraries(dg_diffusion
     ${HYPRE_DIR}/lib/libHYPRE.a
     ${METIS_DIR}/lib/libmetis.a
     OpenMP::OpenMP_CXX
+    CUDA::cudart
+    CUDA::cusparse
+    CUDA::cublas
+    CUDA::curand
     # Additional math libraries that MFEM/Hypre might need
     m
 )
@@ -113,6 +133,7 @@ target_include_directories(test_poisson
     ${HYPRE_DIR}/include
     ${NCCL_ROOT}/include
     ${SPDLOG_DIR}/include
+    ${CUDAToolkit_INCLUDE_DIRS}
 )
 
 target_link_libraries(test_poisson
@@ -123,6 +144,10 @@ target_link_libraries(test_poisson
     ${HYPRE_DIR}/lib/libHYPRE.a
     ${METIS_DIR}/lib/libmetis.a
     OpenMP::OpenMP_CXX
+    CUDA::cudart
+    CUDA::cusparse
+    CUDA::cublas
+    CUDA::curand
     m
 )
 
@@ -145,6 +170,7 @@ target_include_directories(bench_poisson
     ${HYPRE_DIR}/include
     ${NCCL_ROOT}/include
     ${SPDLOG_DIR}/include
+    ${CUDAToolkit_INCLUDE_DIRS}
 )
 
 target_link_libraries(bench_poisson
@@ -155,6 +181,10 @@ target_link_libraries(bench_poisson
     ${HYPRE_DIR}/lib/libHYPRE.a
     ${METIS_DIR}/lib/libmetis.a
     OpenMP::OpenMP_CXX
+    CUDA::cudart
+    CUDA::cusparse
+    CUDA::cublas
+    CUDA::curand
     m
 )
 
@@ -163,3 +193,40 @@ set_target_properties(bench_poisson PROPERTIES
 )
 
 target_link_options(bench_poisson PRIVATE -Wl,-rpath,${NCCL_ROOT}/lib)
+
+# Hypre GPU-only benchmark (MFEM/Hypre on device)
+add_executable(bench_hypre_gpu
+  benchmarks/poisson_bench_hypre_gpu.cpp
+)
+
+target_include_directories(bench_hypre_gpu
+  PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${MFEM_DIR}
+    ${MFEM_DIR}/include
+    ${HYPRE_DIR}/include
+    ${NCCL_ROOT}/include
+    ${SPDLOG_DIR}/include
+    ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+target_link_libraries(bench_hypre_gpu
+  PRIVATE
+    parbell
+    MPI::MPI_CXX
+    ${MFEM_DIR}/libmfem.a
+    ${HYPRE_DIR}/lib/libHYPRE.a
+    ${METIS_DIR}/lib/libmetis.a
+    OpenMP::OpenMP_CXX
+    CUDA::cudart
+    CUDA::cusparse
+    CUDA::cublas
+    CUDA::curand
+    m
+)
+
+set_target_properties(bench_hypre_gpu PROPERTIES
+  CXX_STANDARD 17
+)
+
+target_link_options(bench_hypre_gpu PRIVATE -Wl,-rpath,${NCCL_ROOT}/lib)

@@ -9,4 +9,5 @@ hypre-2.26.0
 CLAUDE.md
 AGENTS.md
 build_mfem.sh
+build_mfem.slurm
 build_mfem_script.sh

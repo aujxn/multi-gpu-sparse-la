@@ -104,7 +104,7 @@ static void run_parcsr_spmv_test(HypreParMatrix &A, const Vector &X_in, const Ve
   // Upload A_ii CSR (must cast double -> float)
   std::vector<float> aii_vals(nnzAii);
   {
-    const double *dv = diag.GetData();
+    const real_t *dv = diag.GetData();
     for (int i = 0; i < nnzAii; ++i) aii_vals[i] = (float)dv[i];
     if (upload_csr(m_local, nnzAii, diag.GetI(), diag.GetJ(), aii_vals.data(),
                    &P.d_Aii_rowptr, &P.d_Aii_colind, &P.d_Aii_val)) {
@@ -116,7 +116,7 @@ static void run_parcsr_spmv_test(HypreParMatrix &A, const Vector &X_in, const Ve
   // Upload A_ij CSR and ghost map (if present)
   std::vector<float> aij_vals(nnzAij);
   if (n_ghost > 0) {
-    const double *dv = offd.GetData();
+    const real_t *dv = offd.GetData();
     for (int i = 0; i < nnzAij; ++i) aij_vals[i] = (float)dv[i];
     if (upload_csr(m_local, nnzAij, offd.GetI(), offd.GetJ(), aij_vals.data(),
                    &P.d_Aij_rowptr, &P.d_Aij_colind, &P.d_Aij_val)) {
