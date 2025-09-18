@@ -148,5 +148,6 @@ static inline int env_flag(const char* name, int defv=0) {
     return (int)strtol(v, nullptr, 10);
 }
 
-// Append a formatted debug line to logs/debug.out with rank prefix
+// Append a formatted debug line to logs with rank prefix
 void debug_logf(int pe, const char* fmt, ...);
+namespace logging { void debug_logf(int pe, const char* fmt, ...); }

@@ -1,4 +1,5 @@
 #include "mfem.hpp"
+#include "utils.h"
 #ifdef MPIX_CUDA_AWARE_SUPPORT
 #include <mpi-ext.h>
 #endif
@@ -21,8 +22,8 @@ int main(int argc, char* argv[])
   // Enable MFEM CUDA backend (assumes MFEM and Hypre were built with CUDA)
   Device device("cuda");
   if (rank == 0) {
-    device.Print();
-    std::cout << "sizeof(real_t)=" << sizeof(mfem::real_t) << "\n";
+    logging::debug_logf(rank, "MFEM device backend: cuda");
+    logging::debug_logf(rank, "sizeof(real_t)=%zu", sizeof(mfem::real_t));
   }
 
   // Optional toggle: select Hypre SpMV backend
@@ -33,7 +34,7 @@ int main(int argc, char* argv[])
       HYPRE_SetSpMVUseVendor((*env == '1') ? 1 : 0);
       if (rank == 0)
       {
-        std::cout << "HYPRE_SetSpMVUseVendor(" << ((*env=='1')?"1":"0") << ")\n";
+        logging::debug_logf(rank, "HYPRE_SetSpMVUseVendor(%s)", ((*env=='1')?"1":"0"));
       }
     }
   }
@@ -94,29 +95,27 @@ int main(int argc, char* argv[])
                               Y.GetMemory().GetMemoryType());
   if (rank == 0)
   {
-    cout << "Device enabled: " << (dev_enabled ? "yes" : "no") << "\n"
-         << "Hypre memory class: " << mc_to_str(hypre_mc) << "\n"
-         << "X host-mem-type: " << (x_host ? "yes" : "no")
-         << ", class-compatible: " << (x_compatible ? "yes" : "no") << "\n"
-         << "Y host-mem-type: " << (y_host ? "yes" : "no")
-         << ", class-compatible: " << (y_compatible ? "yes" : "no") << "\n";
+    logging::debug_logf(rank, "Device enabled: %s", (dev_enabled ? "yes" : "no"));
+    logging::debug_logf(rank, "Hypre memory class: %s", mc_to_str(hypre_mc));
+    logging::debug_logf(rank, "X host-mem-type: %s, class-compatible: %s", (x_host?"yes":"no"), (x_compatible?"yes":"no"));
+    logging::debug_logf(rank, "Y host-mem-type: %s, class-compatible: %s", (y_host?"yes":"no"), (y_compatible?"yes":"no"));
 
     // Report MPI library version
     char mpi_ver[MPI_MAX_LIBRARY_VERSION_STRING]; int len = 0;
     MPI_Get_library_version(mpi_ver, &len);
-    cout << "MPI library: " << string(mpi_ver, len) << "\n";
+    logging::debug_logf(rank, "MPI library: %.*s", len, mpi_ver);
 
     // Compile-time: was hypre built with GPU-aware MPI?
 #ifdef HYPRE_USING_GPU_AWARE_MPI
-    cout << "HYPRE_USING_GPU_AWARE_MPI: yes\n";
+    logging::debug_logf(rank, "HYPRE_USING_GPU_AWARE_MPI: yes");
 #else
-    cout << "HYPRE_USING_GPU_AWARE_MPI: no\n";
+    logging::debug_logf(rank, "HYPRE_USING_GPU_AWARE_MPI: no");
 #endif
 
     // Runtime (Open MPI): query CUDA-aware support if available
 #ifdef MPIX_CUDA_AWARE_SUPPORT
     int cuda_aware = 0; MPIX_Query_cuda_support(&cuda_aware);
-    cout << "MPIX_Query_cuda_support: " << (cuda_aware ? "yes" : "no") << "\n";
+    logging::debug_logf(rank, "MPIX_Query_cuda_support: %s", (cuda_aware?"yes":"no"));
 #endif
   }
 
@@ -161,15 +160,13 @@ int main(int argc, char* argv[])
   {
     double flops_total = 2.0 * (double)global_nnz * (double)iters;
     double gflops = (sec > 0.0) ? (flops_total / sec / 1e9) : 0.0;
-    cout.setf(ios::fixed);
-    cout.precision(6);
-    cout << "Hypre GPU SpMV benchmark\n"
-         << "  MPI ranks: " << size << "\n"
-         << "  DoFs:      " << (long long)fes.GlobalTrueVSize() << "\n"
-         << "  iters:     " << iters << "\n"
-         << "  total:     " << sec << " s\n"
-         << "  per-iter:  " << (1e6 * sec / iters) << " us\n"
-         << "  GFLOP/s:   " << gflops << "\n";
+    logging::debug_logf(rank, "Hypre GPU SpMV benchmark");
+    logging::debug_logf(rank, "  MPI ranks: %d", size);
+    logging::debug_logf(rank, "  DoFs:      %lld", (long long)fes.GlobalTrueVSize());
+    logging::debug_logf(rank, "  iters:     %d", iters);
+    logging::debug_logf(rank, "  total:     %.6f s", sec);
+    logging::debug_logf(rank, "  per-iter:  %.6f us", 1e6 * sec / iters);
+    logging::debug_logf(rank, "  GFLOP/s:   %.6f", gflops);
   }
 
   return 0;

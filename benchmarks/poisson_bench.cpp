@@ -4,6 +4,7 @@
 
 #include <vector>
 #include <iostream>
+#include <string>
 
 using namespace mfem;
 using namespace std;
@@ -15,17 +16,21 @@ int main(int argc, char* argv[]) {
   int rank = Mpi::WorldRank();
   int size = Mpi::WorldSize();
 
+  if (rank==0) logging::debug_logf(rank, "bench_poisson starting | ranks=%d", size);
+
   // Build mesh: 2 serial + 2 parallel refinements
   Mesh serial_mesh = Mesh::MakeCartesian3D(5, 5, 5, Element::TETRAHEDRON);
   for (int i = 0; i < 2; ++i) serial_mesh.UniformRefinement();
   ParMesh pmesh(MPI_COMM_WORLD, serial_mesh);
   serial_mesh.Clear();
   for (int i = 0; i < 3; ++i) pmesh.UniformRefinement();
+  if (rank==0) logging::debug_logf(rank, "mesh built: dim=%d, elements=%d, vertices=%d", pmesh.Dimension(), pmesh.GetNE(), pmesh.GetNV());
 
   // H1 Poisson assembly with homogeneous Dirichlet
   H1_FECollection fec(1, pmesh.Dimension());
   ParFiniteElementSpace fes(&pmesh, &fec);
   Array<int> ess_tdof_list; fes.GetBoundaryTrueDofs(ess_tdof_list);
+  if (rank==0) logging::debug_logf(rank, "FES true dofs=%lld", (long long)fes.GlobalTrueVSize());
 
   ParGridFunction x(&fes); x = 0.0;
   ParLinearForm b(&fes); ConstantCoefficient one(1.0); b.AddDomainIntegrator(new DomainLFIntegrator(one)); b.Assemble();
@@ -33,6 +38,7 @@ int main(int argc, char* argv[]) {
 
   HypreParMatrix A; Vector B, X_dummy;
   a.FormLinearSystem(ess_tdof_list, x, b, A, X_dummy, B);
+  if (rank==0) logging::debug_logf(rank, "FormLinearSystem complete: B size=%lld", (long long)B.Size());
 
   // Build a non-pathological input vector X (random) to avoid near-nullspace issues
   Vector X(B.Size());
@@ -57,6 +63,7 @@ int main(int argc, char* argv[]) {
   int nnzAii = diag.NumNonZeroElems();
   int nnzAij = offd.NumNonZeroElems();
   int n_ghost = offd.Width();
+  long long local_nnz_ll = (long long)nnzAii + (long long)nnzAij;
   HYPRE_BigInt my_col_start = A.GetColStarts()[0];
   HYPRE_BigInt my_col_end   = A.GetColStarts()[1];
   int my_n_local = (int)(my_col_end - my_col_start);
@@ -69,6 +76,8 @@ int main(int argc, char* argv[]) {
   std::vector<gblk> col_starts(size + 1, 0);
   col_starts[0] = (gblk)base0;
   for (int p = 0; p < size; ++p) col_starts[p + 1] = col_starts[p] + (gblk)all_n_local[p];
+  long long global_nnz_est=0; CHECK_MPI(MPI_Allreduce(&local_nnz_ll,&global_nnz_est,1,MPI_LONG_LONG,MPI_SUM,MPI_COMM_WORLD));
+  logging::debug_logf(rank, "matrix local: M=%d N=%d nnz(ii)=%d nnz(ij)=%d ghosts=%d | global nnz~=%lld", m_local, n_local, nnzAii, nnzAij, n_ghost, global_nnz_est);
 
   // Build ParCSR and upload mats
   ParCSR P; if (parcsr_init(&P, rank, size, m_local, n_local, col_starts.data(), nccl)) { MPI_Abort(MPI_COMM_WORLD, 2); }
@@ -94,7 +103,7 @@ int main(int argc, char* argv[]) {
   CUDACHECK(cudaMemset(P.d_y,       0, (size_t)m_local * sizeof(float)));
 
   if (parcsr_create_cusparse_descriptors(&P, nnzAii, nnzAij)) { MPI_Abort(MPI_COMM_WORLD, 4); }
-  if (parcsr_build_comm_plan_from_colmap(&P, MPI_COMM_WORLD)) { debug_logf(rank, "build comm plan failed"); MPI_Abort(MPI_COMM_WORLD, 5); }
+  if (parcsr_build_comm_plan_from_colmap(&P, MPI_COMM_WORLD)) { logging::debug_logf(rank, "build comm plan failed"); MPI_Abort(MPI_COMM_WORLD, 5); }
   // Log plan summary
   {
     int ts = 0, tr = 0;
@@ -103,7 +112,7 @@ int main(int argc, char* argv[]) {
     for (int a = 0; a < P.plan.n_neighbors; ++a) {
       s += " [p=" + std::to_string(P.plan.neighbors[a]) + ": s=" + std::to_string(P.plan.send_counts[a]) + ", r=" + std::to_string(P.plan.recv_counts[a]) + "]";
     }
-    debug_logf(rank, "%s", s.c_str());
+    logging::debug_logf(rank, "%s", s.c_str());
   }
   // Pairwise validation now occurs inside comm plan build.
 
@@ -112,6 +121,7 @@ int main(int argc, char* argv[]) {
   const int iters = 3000;
 
   // Time Hypre SpMV: perform iters applications of A*X into Y_ref
+  if (rank==0) logging::debug_logf(rank, "timing Hypre reference: iters=%d", iters);
   MPI_Barrier(MPI_COMM_WORLD);
   t_hypre.Clear(); t_hypre.Start();
   for (int it = 0; it < iters; ++it) {
@@ -125,11 +135,12 @@ int main(int argc, char* argv[]) {
   CHECK_MPI(MPI_Allreduce(&local_nnz, &global_nnz, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD));
 
   // Time our halo + SpMV on GPU for iters iterations
+  if (rank==0) logging::debug_logf(rank, "timing custom GPU: iters=%d", iters);
   MPI_Barrier(MPI_COMM_WORLD);
   t_gpu.Clear(); t_gpu.Start();
   for (int it = 0; it < iters; ++it) {
-    if (parcsr_halo_x(&P) != 0) { debug_logf(rank, "parcsr_halo_x failed at iter %d", it); MPI_Abort(MPI_COMM_WORLD, 11); }
-    if (parcsr_spmv(&P)   != 0) { debug_logf(rank, "parcsr_spmv failed at iter %d", it);   MPI_Abort(MPI_COMM_WORLD, 12); }
+    if (parcsr_halo_x(&P) != 0) { logging::debug_logf(rank, "parcsr_halo_x failed at iter %d", it); MPI_Abort(MPI_COMM_WORLD, 11); }
+    if (parcsr_spmv(&P)   != 0) { logging::debug_logf(rank, "parcsr_spmv failed at iter %d", it);   MPI_Abort(MPI_COMM_WORLD, 12); }
   }
   MPI_Barrier(MPI_COMM_WORLD);
   double ours_sec = t_gpu.RealTime();
@@ -157,13 +168,27 @@ int main(int argc, char* argv[]) {
     double flops_total = 2.0 * (double)global_nnz * (double)iters;
     double hypre_gflops = (hypre_sec > 0.0) ? (flops_total / hypre_sec / 1e9) : 0.0;
     double gpu_gflops   = (ours_sec  > 0.0) ? (flops_total / ours_sec  / 1e9) : 0.0;
-    debug_logf(rank,
-               "DoFs=%lld | Hypre total=%.6f s (%.2f GF/s) per-iter=%.3f us | GPU total=%.6f s (%.2f GF/s) per-iter=%.3f us | ||y||=%.6e ||y_ref||=%.6e | L2 err=%.6e rel L2=%.6e",
-               (long long)fes.GlobalTrueVSize(),
-               hypre_sec, hypre_gflops, 1e6 * hypre_sec / iters,
-               ours_sec,  gpu_gflops,  1e6 * ours_sec  / iters,
-               y_l2, yref_l2,
-               l2, rel_l2);
+
+    // Hypre CPU SpMV block (match hypre_gpu bench format)
+    logging::debug_logf(rank, "Hypre CPU SpMV benchmark");
+    logging::debug_logf(rank, "  MPI ranks: %d", size);
+    logging::debug_logf(rank, "  DoFs:      %lld", (long long)fes.GlobalTrueVSize());
+    logging::debug_logf(rank, "  iters:     %d", iters);
+    logging::debug_logf(rank, "  total:     %.6f s", hypre_sec);
+    logging::debug_logf(rank, "  per-iter:  %.6f us", 1e6 * hypre_sec / iters);
+    logging::debug_logf(rank, "  GFLOP/s:   %.6f", hypre_gflops);
+
+    // Custom GPU SpMV block (our implementation)
+    logging::debug_logf(rank, "Custom GPU SpMV benchmark");
+    logging::debug_logf(rank, "  MPI ranks: %d", size);
+    logging::debug_logf(rank, "  DoFs:      %lld", (long long)fes.GlobalTrueVSize());
+    logging::debug_logf(rank, "  iters:     %d", iters);
+    logging::debug_logf(rank, "  total:     %.6f s", ours_sec);
+    logging::debug_logf(rank, "  per-iter:  %.6f us", 1e6 * ours_sec / iters);
+    logging::debug_logf(rank, "  GFLOP/s:   %.6f", gpu_gflops);
+
+    // Accuracy summary
+    logging::debug_logf(rank, "  ||y||=%.6e  ||y_ref||=%.6e  L2 err=%.6e  rel L2=%.6e", y_l2, yref_l2, l2, rel_l2);
   }
 
   parcsr_free(&P);

@@ -30,9 +30,11 @@ if command -v nvcc >/dev/null 2>&1; then
     export LD_LIBRARY_PATH="$CUDA_HOME/extras/CUPTI/lib64:$LD_LIBRARY_PATH"
   fi
 fi
-which ncu || true
-ncu --version || true
-echo "LD_LIBRARY_PATH begins with: ${LD_LIBRARY_PATH%%:*}" || true
+if [[ "${PROFILE_WITH_NCU:-0}" -eq 1 ]]; then
+  which ncu || true
+  ncu --version || true
+  echo "LD_LIBRARY_PATH begins with: ${LD_LIBRARY_PATH%%:*}" || true
+fi
 
 export NCCL_SOCKET_IFNAME=ens2,ib0
 export NCCL_DEBUG=INFO
