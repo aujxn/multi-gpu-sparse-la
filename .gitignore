@@ -1,5 +1,6 @@
 build
 logs
+ncu_reports
 .cache
 .clangd
 CLAUDE.md

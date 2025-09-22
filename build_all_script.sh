@@ -16,9 +16,10 @@ fi
 WITH_MPI=${WITH_MPI:-1}
 WITH_CUDA=${WITH_CUDA:-0}
 GPU_AWARE=${GPU_AWARE:-1}
+WITH_OPENMP=${WITH_OPENMP:-1}
 PRECISION=${PRECISION:-double}
 BUILD_TYPE=${BUILD_TYPE:-RelWithDebInfo}
-export WITH_MPI WITH_CUDA GPU_AWARE PRECISION BUILD_TYPE
+export WITH_MPI WITH_CUDA GPU_AWARE WITH_OPENMP PRECISION BUILD_TYPE
 
 # Sources
 HYPRE_SRC=${HYPRE_SRC:-"$HOME/opt/src/hypre"}
@@ -45,9 +46,10 @@ fi
 MPIK=$([[ "$WITH_MPI" == 1 ]] && echo mpi || echo seq)
 CUDAK=$([[ "$WITH_CUDA" == 1 ]] && echo cuda || echo cpu)
 GAK=$([[ "$GPU_AWARE" == 1 ]] && echo gawa || echo nogawa)
+OMPK=$([[ "$WITH_OPENMP" == 1 ]] && echo omp || echo noomp)
 PCK=$([[ "$PRECISION" == single ]] && echo sp || echo dp)
 BTK=${BUILD_TYPE}
-VARIANT_KEY="${MPIK}-${CUDAK}-${GAK}-${PCK}-${BTK}"
+VARIANT_KEY="${MPIK}-${CUDAK}-${GAK}-${OMPK}-${PCK}-${BTK}"
 echo "Variant key: $VARIANT_KEY"
 
 DEPS_PREFIX_BASE=${DEPS_PREFIX_BASE:-"/scratch/ajn6-amg/multi_gpu"}
@@ -94,6 +96,16 @@ step "Configure Hypre → $H_INST (in-tree)" bash -c "
   [[ -x ./configure ]] || autoreconf -i
   PREC_FLAG=\$( [[ \"\${PRECISION}\" == single ]] && echo --enable-single || echo '' )
   CUDA_FLAG=\$( [[ \"\${WITH_CUDA}\" == 1 ]] && echo --with-cuda || echo '' )
+  OMP_FLAG=
+  if [[ \"\${WITH_OPENMP}\" == 1 ]]; then
+    if ./configure --help 2>/dev/null | grep -q -- '--with-openmp'; then
+      OMP_FLAG=--with-openmp
+    elif ./configure --help 2>/dev/null | grep -q -- '--with_openmp'; then
+      OMP_FLAG=--with_openmp
+    else
+      echo 'Note: hypre configure has no --with-openmp/--with_openmp option' >&2
+    fi
+  fi
   GPU_FLAG=
   if [[ \"\${GPU_AWARE}\" == 0 ]]; then
     if ./configure --help 2>/dev/null | grep -q -- '--disable-gpu-aware-mpi'; then
@@ -101,12 +113,18 @@ step "Configure Hypre → $H_INST (in-tree)" bash -c "
     else
       echo 'Note: hypre configure has no --disable-gpu-aware-mpi; relying on autodetect' >&2
     fi
+  else
+    if ./configure --help 2>/dev/null | grep -q -- '--enable-gpu-aware-mpi'; then
+      GPU_FLAG=--enable-gpu-aware-mpi
+    else
+      echo 'Note: hypre configure has no --enable-gpu-aware-mpi; relying on autodetect' >&2
+    fi
   fi
   FORT_FLAG=--disable-fortran
   if [[ \"\${WITH_MPI}\" == 1 ]]; then
-    env ${GPU_CC:+HYPRE_CUDA_SM=${GPU_CC}} CC=mpicc CXX=mpic++ ./configure --prefix=\"$H_INST\" \$FORT_FLAG \$PREC_FLAG \$CUDA_FLAG \$GPU_FLAG
+    env ${GPU_CC:+HYPRE_CUDA_SM=${GPU_CC}} CC=mpicc CXX=mpic++ ./configure --prefix=\"$H_INST\" \$FORT_FLAG \$PREC_FLAG \$CUDA_FLAG \$OMP_FLAG \$GPU_FLAG
   else
-    env ${GPU_CC:+HYPRE_CUDA_SM=${GPU_CC}} CC=gcc CXX=g++ ./configure --prefix=\"$H_INST\" \$FORT_FLAG \$PREC_FLAG \$CUDA_FLAG \$GPU_FLAG
+    env ${GPU_CC:+HYPRE_CUDA_SM=${GPU_CC}} CC=gcc CXX=g++ ./configure --prefix=\"$H_INST\" \$FORT_FLAG \$PREC_FLAG \$CUDA_FLAG \$OMP_FLAG \$GPU_FLAG
   fi
 "
 
@@ -114,10 +132,12 @@ step "Build + install Hypre" bash -c "set -euo pipefail; cd \"$HYPRE_AUTOTOOLS_S
 
 # MFEM builds
 MFEM_PREC_FLAG=$([[ "$PRECISION" == single ]] && echo MFEM_PRECISION=single || echo '')
+MFEM_OMP_FLAG=$([[ "$WITH_OPENMP" == 1 ]] && echo MFEM_USE_OPENMP=YES || echo MFEM_USE_OPENMP=NO)
+MFEM_TS_FLAG=$([[ "$WITH_OPENMP" == 1 ]] && echo MFEM_THREAD_SAFE=YES || echo '')
 step "MFEM clean" bash -c "set -euo pipefail; cd '$MFEM_SRC' && make clean || true"
-step "MFEM serial" bash -c "set -euo pipefail; cd '$MFEM_SRC' && make -j serial $MFEM_PREC_FLAG"
+step "MFEM serial" bash -c "set -euo pipefail; cd '$MFEM_SRC' && make -j serial $MFEM_PREC_FLAG $MFEM_OMP_FLAG"
 if [[ "$WITH_MPI" == 1 && "${WITH_CUDA}" != 1 ]]; then
-  step "MFEM parallel" bash -c "set -euo pipefail; cd '$MFEM_SRC' && make -j parallel $MFEM_PREC_FLAG MFEM_USE_METIS_5=YES METIS_DIR='$METIS_SRC' MFEM_USE_OPENMP=YES MFEM_THREAD_SAFE=YES HYPRE_DIR='$H_INST'"
+  step "MFEM parallel" bash -c "set -euo pipefail; cd '$MFEM_SRC' && make -j parallel $MFEM_PREC_FLAG MFEM_USE_METIS_5=YES METIS_DIR='$METIS_SRC' $MFEM_OMP_FLAG $MFEM_TS_FLAG HYPRE_DIR='$H_INST'"
 fi
 if [[ "$WITH_CUDA" == 1 ]]; then
   if [[ -z "${CUDA_DIR:-}" && -x "$(command -v nvcc)" ]]; then CUDA_DIR="$(dirname "$(dirname "$(command -v nvcc)")")"; fi

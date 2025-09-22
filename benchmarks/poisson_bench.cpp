@@ -1,10 +1,16 @@
 #include "mfem.hpp"
+#include "mfem-performance.hpp"
 #include "par_csr.h"
 #include "utils.h"
 
 #include <vector>
 #include <iostream>
 #include <string>
+#include <fstream>
+#include <unistd.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 using namespace mfem;
 using namespace std;
@@ -15,36 +21,99 @@ int main(int argc, char* argv[]) {
   Hypre::Init();
   int rank = Mpi::WorldRank();
   int size = Mpi::WorldSize();
+  const int debug_mem = env_flag("DEBUG_MEM", 0);
+  // Report OpenMP threading
+  int omp_threads = 1;
+  int omp_max_threads = 1;
+  int omp_num_procs = 1;
+#ifdef _OPENMP
+#pragma omp parallel
+  {
+#pragma omp master
+    { omp_threads = omp_get_num_threads(); }
+  }
+  omp_max_threads = omp_get_max_threads();
+  omp_num_procs = omp_get_num_procs();
+#endif
+  const char* omp_env = std::getenv("OMP_NUM_THREADS");
+  const char* slurm_cpt = std::getenv("SLURM_CPUS_PER_TASK");
+  logging::debug_logf(rank, "OpenMP threads: team=%d max=%d procs=%d (OMP_NUM_THREADS=%s SLURM_CPUS_PER_TASK=%s)",
+                                   omp_threads, omp_max_threads, omp_num_procs,
+                                   omp_env?omp_env:"unset", slurm_cpt?slurm_cpt:"unset");
+  StageLogger stage(rank, debug_mem);
 
-  if (rank==0) logging::debug_logf(rank, "bench_poisson starting | ranks=%d", size);
+  logging::debug_logf(rank, "bench_poisson starting | ranks=%d", size);
 
-  // Build mesh: 2 serial + 2 parallel refinements
-  Mesh serial_mesh = Mesh::MakeCartesian3D(5, 5, 5, Element::TETRAHEDRON);
-  for (int i = 0; i < 2; ++i) serial_mesh.UniformRefinement();
+  // Build mesh: configurable serial/parallel refinements and base grid via env
+  const int nx = env_flag("MESH_NX", 5);
+  const int ny = env_flag("MESH_NY", nx);
+  const int nz = env_flag("MESH_NZ", nx);
+  const int sref = env_flag("SERIAL_REFS", 2);
+  const int pref = env_flag("PAR_REFS", 3);
+  logging::debug_logf(rank, "mesh params: nx=%d ny=%d nz=%d sref=%d pref=%d", nx, ny, nz, sref, pref);
+  Mesh serial_mesh = Mesh::MakeCartesian3D(nx, ny, nz, Element::TETRAHEDRON);
+  for (int i = 0; i < sref; ++i) serial_mesh.UniformRefinement();
   ParMesh pmesh(MPI_COMM_WORLD, serial_mesh);
   serial_mesh.Clear();
-  for (int i = 0; i < 3; ++i) pmesh.UniformRefinement();
-  if (rank==0) logging::debug_logf(rank, "mesh built: dim=%d, elements=%d, vertices=%d", pmesh.Dimension(), pmesh.GetNE(), pmesh.GetNV());
+  for (int i = 0; i < pref; ++i) pmesh.UniformRefinement();
+  logging::debug_logf(rank, "mesh built: dim=%d, elements=%d, vertices=%d", pmesh.Dimension(), pmesh.GetNE(), pmesh.GetNV());
+  stage.log("mesh_ready");
 
   // H1 Poisson assembly with homogeneous Dirichlet
-  H1_FECollection fec(1, pmesh.Dimension());
+  // Use MFEM's high-performance templated bilinear form (full assembly)
+  // on tetrahedra with order-1 H1 elements.
+  static constexpr Geometry::Type geom = Geometry::TETRAHEDRON;
+  static constexpr int mesh_p = 1;
+  static constexpr int sol_p  = 1;
+  using mesh_fe_t  = H1_FiniteElement<geom, mesh_p>;
+  using mesh_fes_t = H1_FiniteElementSpace<mesh_fe_t>;
+  using mesh_t     = TMesh<mesh_fes_t>;
+  using sol_fe_t   = H1_FiniteElement<geom, sol_p>;
+  using sol_fes_t  = H1_FiniteElementSpace<sol_fe_t>;
+  static constexpr int ir_order = 2*sol_p + Geometry::Constants<geom>::Dimension - 1;
+  using int_rule_t = TIntegrationRule<geom, ir_order>;
+  using coeff_t    = TConstantCoefficient<>;
+  using integ_t    = TIntegrator<coeff_t, TDiffusionKernel>;
+  using HPCBilinearForm = TBilinearForm<mesh_t, sol_fes_t, int_rule_t, integ_t>;
+
+  // Ensure the mesh matches the HPC template expectations; if node curvature
+  // is missing, set linear curvature so MatchesNodes() passes.
+  MFEM_VERIFY(mesh_t::MatchesGeometry(pmesh), "Mesh geometry must be tetrahedra for HPC path");
+  if (!mesh_t::MatchesNodes(pmesh)) { pmesh.SetCurvature(mesh_p, false, -1, Ordering::byNODES); }
+
+  H1_FECollection fec(sol_p, pmesh.Dimension());
   ParFiniteElementSpace fes(&pmesh, &fec);
   Array<int> ess_tdof_list; fes.GetBoundaryTrueDofs(ess_tdof_list);
-  if (rank==0) logging::debug_logf(rank, "FES true dofs=%lld", (long long)fes.GlobalTrueVSize());
+  logging::debug_logf(rank, "FES true dofs=%lld", (long long)fes.GlobalTrueVSize());
+  logging::debug_logf(rank, "FES ess_tdofs=%lld", (long long)ess_tdof_list.Size());
+  stage.log("fes_ready");
 
+  // We don't need a RHS for this benchmark; skip building ParLinearForm to save memory.
   ParGridFunction x(&fes); x = 0.0;
-  ParLinearForm b(&fes); ConstantCoefficient one(1.0); b.AddDomainIntegrator(new DomainLFIntegrator(one)); b.Assemble();
-  ParBilinearForm a(&fes); a.AddDomainIntegrator(new DiffusionIntegrator); a.Assemble();
+  ParBilinearForm a(&fes);
+  a.UsePrecomputedSparsity();
+  stage.log("before_a_assemble_hpc");
+  {
+    HPCBilinearForm a_hpc(integ_t(coeff_t(1.0)), fes);
+    a_hpc.AssembleBilinearForm(a); // full matrix assembly via templated API
+  }
+  stage.log("after_a_assemble_hpc");
 
-  HypreParMatrix A; Vector B, X_dummy;
-  a.FormLinearSystem(ess_tdof_list, x, b, A, X_dummy, B);
-  if (rank==0) logging::debug_logf(rank, "FormLinearSystem complete: B size=%lld", (long long)B.Size());
+  HypreParMatrix* A;
+  stage.log("before_form_system");
+  // Assemble the parallel matrix and apply homogeneous Dirichlet BCs in-place
+  // to avoid the extra workspace used by FormSystemMatrix.
+  A = a.ParallelAssemble();
+  if (!A) { logging::debug_logf(rank, "ParallelAssemble returned null"); MPI_Abort(MPI_COMM_WORLD, 6); }
+  A->EliminateRowsCols(ess_tdof_list);
+  logging::debug_logf(rank, "ParallelAssemble+EliminateRowsCols complete: local rows=%d global rows=%lld", A->Height(), (long long)A->GetGlobalNumRows());
+  stage.log("linear_system");
 
   // Build a non-pathological input vector X (random) to avoid near-nullspace issues
-  Vector X(B.Size());
+  Vector X(A->Height());
   X.Randomize(12345);
   // Reference SpMV: Y_ref = A * X
-  Vector Y_ref(B.Size());
+  Vector Y_ref(A->Height());
 
   // Initialize GPU device + NCCL (optional)
   init_gpu_for_rank();
@@ -57,15 +126,15 @@ int main(int argc, char* argv[]) {
   }
 
   // Extract local matrices and col_starts
-  SparseMatrix diag, offd; A.GetDiag(diag); HYPRE_BigInt* offd_cmap = nullptr; A.GetOffd(offd, offd_cmap);
+  SparseMatrix diag, offd; A->GetDiag(diag); HYPRE_BigInt* offd_cmap = nullptr; A->GetOffd(offd, offd_cmap);
   int m_local = diag.Height();
   int n_local = diag.Width();
   int nnzAii = diag.NumNonZeroElems();
   int nnzAij = offd.NumNonZeroElems();
   int n_ghost = offd.Width();
   long long local_nnz_ll = (long long)nnzAii + (long long)nnzAij;
-  HYPRE_BigInt my_col_start = A.GetColStarts()[0];
-  HYPRE_BigInt my_col_end   = A.GetColStarts()[1];
+  HYPRE_BigInt my_col_start = A->GetColStarts()[0];
+  HYPRE_BigInt my_col_end   = A->GetColStarts()[1];
   int my_n_local = (int)(my_col_end - my_col_start);
   std::vector<int> all_n_local(size);
   CHECK_MPI(MPI_Allgather(&my_n_local, 1, MPI_INT, all_n_local.data(), 1, MPI_INT, MPI_COMM_WORLD));
@@ -78,9 +147,11 @@ int main(int argc, char* argv[]) {
   for (int p = 0; p < size; ++p) col_starts[p + 1] = col_starts[p] + (gblk)all_n_local[p];
   long long global_nnz_est=0; CHECK_MPI(MPI_Allreduce(&local_nnz_ll,&global_nnz_est,1,MPI_LONG_LONG,MPI_SUM,MPI_COMM_WORLD));
   logging::debug_logf(rank, "matrix local: M=%d N=%d nnz(ii)=%d nnz(ij)=%d ghosts=%d | global nnz~=%lld", m_local, n_local, nnzAii, nnzAij, n_ghost, global_nnz_est);
+  stage.log("extracted_blocks");
 
   // Build ParCSR and upload mats
   ParCSR P; if (parcsr_init(&P, rank, size, m_local, n_local, col_starts.data(), nccl)) { MPI_Abort(MPI_COMM_WORLD, 2); }
+  stage.log("parcsr_init");
   // Upload Aii
   std::vector<float> aii_vals(nnzAii); { const real_t* dv = diag.GetData(); for (int i = 0; i < nnzAii; ++i) aii_vals[i] = (float)dv[i]; }
   if (upload_csr(m_local, nnzAii, diag.GetI(), diag.GetJ(), aii_vals.data(), &P.d_Aii_rowptr, &P.d_Aii_colind, &P.d_Aii_val)) { MPI_Abort(MPI_COMM_WORLD, 3); }
@@ -103,7 +174,9 @@ int main(int argc, char* argv[]) {
   CUDACHECK(cudaMemset(P.d_y,       0, (size_t)m_local * sizeof(float)));
 
   if (parcsr_create_cusparse_descriptors(&P, nnzAii, nnzAij)) { MPI_Abort(MPI_COMM_WORLD, 4); }
+  stage.log("cusparse_desc_ready");
   if (parcsr_build_comm_plan_from_colmap(&P, MPI_COMM_WORLD)) { logging::debug_logf(rank, "build comm plan failed"); MPI_Abort(MPI_COMM_WORLD, 5); }
+  stage.log("comm_plan_built");
   // Log plan summary
   {
     int ts = 0, tr = 0;
@@ -118,24 +191,40 @@ int main(int argc, char* argv[]) {
 
   // Timers and iteration count
   StopWatch t_hypre, t_gpu;
-  const int iters = 3000;
+  int iters = env_flag("GPU_ITERS", 3000);
+  int cpu_iters = env_flag("CPU_ITERS", iters);
+  const int skip_cpu_ref = env_flag("SKIP_CPU_REF", 0);
+  if (skip_cpu_ref && cpu_iters > 1) cpu_iters = 1;
 
   // Time Hypre SpMV: perform iters applications of A*X into Y_ref
-  if (rank==0) logging::debug_logf(rank, "timing Hypre reference: iters=%d", iters);
+  logging::debug_logf(rank, "timing Hypre reference: iters=%d", cpu_iters);
   MPI_Barrier(MPI_COMM_WORLD);
   t_hypre.Clear(); t_hypre.Start();
-  for (int it = 0; it < iters; ++it) {
-    A.Mult(X, Y_ref);
+  for (int it = 0; it < cpu_iters; ++it) {
+    A->Mult(X, Y_ref);
   }
+  delete A;
   MPI_Barrier(MPI_COMM_WORLD);
   double hypre_sec = t_hypre.RealTime();
+  stage.log("hypre_done");
   // Global nnz for GFLOP/s estimation (2 flops per nonzero)
   long long local_nnz = (long long)nnzAii + (long long)nnzAij;
   long long global_nnz = 0;
   CHECK_MPI(MPI_Allreduce(&local_nnz, &global_nnz, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD));
+  logging::debug_logf(rank, "global nnz: %lld", global_nnz);
+
+  // Warmup custom GPU path to prime kernels/descriptors (match hypre gpu bench)
+  int warmup = env_flag("WARMUP_ITERS", 10);
+  if (warmup > 0) {
+    for (int w = 0; w < warmup; ++w) {
+      if (parcsr_halo_x(&P) != 0) { logging::debug_logf(rank, "parcsr_halo_x warmup failed at iter %d", w); MPI_Abort(MPI_COMM_WORLD, 21); }
+      if (parcsr_spmv(&P)   != 0) { logging::debug_logf(rank, "parcsr_spmv warmup failed at iter %d", w);   MPI_Abort(MPI_COMM_WORLD, 22); }
+    }
+    stage.log("warmup_done");
+  }
 
   // Time our halo + SpMV on GPU for iters iterations
-  if (rank==0) logging::debug_logf(rank, "timing custom GPU: iters=%d", iters);
+  logging::debug_logf(rank, "timing custom GPU: iters=%d", iters);
   MPI_Barrier(MPI_COMM_WORLD);
   t_gpu.Clear(); t_gpu.Start();
   for (int it = 0; it < iters; ++it) {
@@ -144,10 +233,12 @@ int main(int argc, char* argv[]) {
   }
   MPI_Barrier(MPI_COMM_WORLD);
   double ours_sec = t_gpu.RealTime();
+  stage.log("gpu_done");
 
   // Gather result and compute global L2 errors and norms
   std::vector<float> y(m_local, 0.0f);
   CUDACHECK(cudaMemcpy(y.data(), P.d_y, (size_t)m_local * sizeof(float), cudaMemcpyDeviceToHost));
+  stage.log("copy_back_y");
   double local_err2 = 0.0, local_ref2 = 0.0, local_y2 = 0.0;
   for (int i = 0; i < m_local; ++i) {
     double di = (double)y[i] - (double)Y_ref[i];
@@ -166,16 +257,18 @@ int main(int argc, char* argv[]) {
 
   if (rank == 0) {
     double flops_total = 2.0 * (double)global_nnz * (double)iters;
-    double hypre_gflops = (hypre_sec > 0.0) ? (flops_total / hypre_sec / 1e9) : 0.0;
+    // CPU flops_total should reflect cpu_iters
+    double cpu_flops_total = 2.0 * (double)global_nnz * (double)cpu_iters;
+    double hypre_gflops = (hypre_sec > 0.0) ? (cpu_flops_total / hypre_sec / 1e9) : 0.0;
     double gpu_gflops   = (ours_sec  > 0.0) ? (flops_total / ours_sec  / 1e9) : 0.0;
 
     // Hypre CPU SpMV block (match hypre_gpu bench format)
     logging::debug_logf(rank, "Hypre CPU SpMV benchmark");
     logging::debug_logf(rank, "  MPI ranks: %d", size);
     logging::debug_logf(rank, "  DoFs:      %lld", (long long)fes.GlobalTrueVSize());
-    logging::debug_logf(rank, "  iters:     %d", iters);
+    logging::debug_logf(rank, "  iters:     %d", cpu_iters);
     logging::debug_logf(rank, "  total:     %.6f s", hypre_sec);
-    logging::debug_logf(rank, "  per-iter:  %.6f us", 1e6 * hypre_sec / iters);
+    logging::debug_logf(rank, "  per-iter:  %.6f us", 1e6 * hypre_sec / (cpu_iters > 0 ? cpu_iters : 1));
     logging::debug_logf(rank, "  GFLOP/s:   %.6f", hypre_gflops);
 
     // Custom GPU SpMV block (our implementation)

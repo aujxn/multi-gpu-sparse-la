@@ -4,6 +4,22 @@
 #include <string>
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/basic_file_sink.h>
+#include <filesystem>
+
+static std::string sanitize_job_name(const char* name) {
+    if (!name || !*name) return std::string("debug");
+    std::string out; out.reserve(64);
+    for (const char* p = name; *p; ++p) {
+        char c = *p;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.') {
+            out.push_back(c);
+        } else {
+            out.push_back('_');
+        }
+    }
+    if (out.empty()) out = "debug";
+    return out;
+}
 
 static std::shared_ptr<spdlog::logger> get_or_create_logger(int pe) {
     char lname[32];
@@ -12,11 +28,16 @@ static std::shared_ptr<spdlog::logger> get_or_create_logger(int pe) {
     if (logger) return logger;
     try {
         const char* job = std::getenv("SLURM_JOB_ID");
+        const char* jname = std::getenv("SLURM_JOB_NAME");
+        std::string base = sanitize_job_name(jname);
         char path[512];
+        // Ensure logs directory exists (ignore errors)
+        std::error_code ec;
+        std::filesystem::create_directories("logs", ec);
         if (job && *job) {
-            snprintf(path, sizeof(path), "logs/debug.%s.rank%04d.out", job, pe);
+            snprintf(path, sizeof(path), "logs/%s.%s.rank%04d.out", base.c_str(), job, pe);
         } else {
-            snprintf(path, sizeof(path), "logs/debug.rank%04d.out", pe);
+            snprintf(path, sizeof(path), "logs/%s.rank%04d.out", base.c_str(), pe);
         }
         auto sink = std::make_shared<spdlog::sinks::basic_file_sink_st>(path, true);
         auto new_logger = std::make_shared<spdlog::logger>(lname, sink);

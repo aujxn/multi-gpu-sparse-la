@@ -151,3 +151,21 @@ static inline int env_flag(const char* name, int defv=0) {
 // Append a formatted debug line to logs with rank prefix
 void debug_logf(int pe, const char* fmt, ...);
 namespace logging { void debug_logf(int pe, const char* fmt, ...); }
+
+// Lightweight stage logger that reports timing deltas and optional memory info
+#include <chrono>
+class StageLogger {
+public:
+    explicit StageLogger(int rank, bool debug_mem)
+      : rank_(rank), debug_mem_(debug_mem), start_(clock::now()), last_(start_) {}
+
+    // Log a stage with time since previous log and optional memory diagnostics
+    void log(const char* stage);
+
+private:
+    using clock = std::chrono::steady_clock;
+    int rank_;
+    bool debug_mem_;
+    clock::time_point start_;
+    clock::time_point last_;
+};

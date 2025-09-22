@@ -64,6 +64,7 @@ add_library(parbell STATIC
   src/par_csr.cu
   src/comm_pkg.cpp
   src/logging.cpp
+  src/stage_logger.cpp
 )
 
 target_include_directories(parbell
